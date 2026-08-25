@@ -77,6 +77,13 @@ Overlay terminal_page {
       released => $mouse_up();
       button: 0;
     }
+
+    GestureDrag {
+      drag-begin => $touch_drag_begin();
+      drag-update => $touch_drag_update();
+      drag-end => $touch_drag_end();
+      touch-only: true;
+    }
   };
 
   [overlay]
