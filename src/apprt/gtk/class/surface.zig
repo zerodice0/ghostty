@@ -732,7 +732,8 @@ pub const Surface = extern struct {
         /// until release so movement can become a swipe without first sending
         /// a mouse press to the terminal.
         touch_gesture: touch.Gesture = .{},
-        suppress_touch_tap: bool = false,
+        suppress_touch_click: bool = false,
+        touch_selection_active: bool = false,
 
         /// How much pending horizontal scroll do we have?
         pending_horizontal_scroll: f64 = 0.0,
@@ -1811,7 +1812,8 @@ pub const Surface = extern struct {
         priv.precision_scroll = false;
         priv.cursor_pos = .{ .x = 0, .y = 0 };
         priv.touch_gesture = .{};
-        priv.suppress_touch_tap = false;
+        priv.suppress_touch_click = false;
+        priv.touch_selection_active = false;
         priv.mouse_shape = .text;
         priv.mouse_hidden = false;
         priv.focused = true;
@@ -3009,8 +3011,9 @@ pub const Surface = extern struct {
         self: *Self,
     ) callconv(.c) void {
         const priv = self.private();
+        self.endTouchSelection(.{});
         priv.touch_gesture.begin(.{ .x = x, .y = y });
-        priv.suppress_touch_tap = false;
+        priv.suppress_touch_click = false;
 
         // Match mouse press behavior for focus and bell handling. A touch
         // which only changes focus must not also click into the terminal.
@@ -3020,7 +3023,7 @@ pub const Surface = extern struct {
         const gl_area_widget = priv.gl_area.as(gtk.Widget);
         const had_focus = gl_area_widget.hasFocus() != 0;
         if (!had_focus) _ = gl_area_widget.grabFocus();
-        priv.suppress_touch_tap = !had_focus;
+        priv.suppress_touch_click = !had_focus;
     }
 
     fn gcTouchDragUpdate(
@@ -3034,9 +3037,14 @@ pub const Surface = extern struct {
             .y = offset_y,
         }) orelse return;
 
+        const mods = touchModifiers(gesture);
         switch (update) {
-            .scroll => |scroll| self.handleTouchScroll(gesture, scroll),
-            .rejected => _ = gesture.as(gtk.Gesture).setState(.denied),
+            .scroll => |scroll| self.handleTouchScroll(gesture, scroll, mods),
+            .selection => |selection| self.handleTouchSelection(
+                gesture,
+                selection,
+                mods,
+            ),
         }
     }
 
@@ -3047,23 +3055,43 @@ pub const Surface = extern struct {
         self: *Self,
     ) callconv(.c) void {
         const priv = self.private();
+        const event = gesture.as(gtk.EventController).getCurrentEvent();
+        const mods = touchModifiers(gesture);
+        const cancelled = if (event) |value|
+            value.getEventType() == .touch_cancel
+        else
+            false;
+
+        const suppress_click = priv.suppress_touch_click;
+        priv.suppress_touch_click = false;
+
+        if (cancelled) {
+            priv.touch_gesture.cancel();
+            self.endTouchSelection(mods);
+            return;
+        }
+
         const result = priv.touch_gesture.finish(.{
             .x = offset_x,
             .y = offset_y,
         });
-        const suppress_tap = priv.suppress_touch_tap;
-        priv.suppress_touch_tap = false;
 
         switch (result) {
             .tap => |point| {
-                if (suppress_tap) return;
+                if (suppress_click) return;
 
-                const event = gesture.as(gtk.EventController).getCurrentEvent() orelse return;
-                if (event.getEventType() == .touch_cancel) return;
-                self.touchTap(event, point);
+                self.touchTap(event orelse return, point);
             },
-            .scroll => |scroll| self.handleTouchScroll(gesture, scroll),
-            .cancel => {},
+            .scroll => |scroll| self.handleTouchScroll(gesture, scroll, mods),
+            .selection => |selection| {
+                if (!suppress_click) self.handleTouchSelection(
+                    gesture,
+                    selection,
+                    mods,
+                );
+                self.endTouchSelection(mods);
+            },
+            .cancel => self.endTouchSelection(mods),
         }
     }
 
@@ -3071,19 +3099,65 @@ pub const Surface = extern struct {
         self: *Self,
         gesture: *gtk.GestureDrag,
         scroll: touch.Gesture.Scroll,
+        mods: input.Mods,
     ) void {
         if (scroll.origin) |origin| {
             // Claim the sequence before the ancestor GtkScrolledWindow can
             // interpret the same movement as an adjustment drag.
             if (gesture.as(gtk.Gesture).setState(.claimed) == 0) return;
 
-            const event = gesture.as(gtk.EventController).getCurrentEvent() orelse return;
-            const mods = gtk_key.translateMods(event.getModifierState());
             if (!self.updateCursorPosition(self.cursorPosition(origin.x, origin.y), mods))
                 return;
         }
 
         self.touchScroll(scroll.delta_y);
+    }
+
+    fn handleTouchSelection(
+        self: *Self,
+        gesture: *gtk.GestureDrag,
+        selection: touch.Gesture.Selection,
+        mods: input.Mods,
+    ) void {
+        const priv = self.private();
+
+        if (selection.origin) |origin| {
+            // Match mouse click focus behavior: a gesture that only focused an
+            // inactive surface must not also begin a terminal selection.
+            if (priv.suppress_touch_click) return;
+
+            // Selection owns the sequence once horizontal movement wins the
+            // direction classification. Subsequent vertical movement remains
+            // selection so the user can select across terminal rows.
+            if (gesture.as(gtk.Gesture).setState(.claimed) == 0) return;
+            if (!self.updateCursorPosition(self.cursorPosition(origin.x, origin.y), mods))
+                return;
+
+            const surface = priv.core_surface orelse return;
+            priv.touch_selection_active = true;
+            _ = surface.mouseButtonCallback(.press, .left, mods) catch |err| {
+                log.warn("error in touch selection press callback err={}", .{err});
+                self.endTouchSelection(mods);
+                return;
+            };
+        }
+
+        if (!priv.touch_selection_active) return;
+        if (!self.updateCursorPosition(
+            self.cursorPosition(selection.point.x, selection.point.y),
+            mods,
+        )) self.endTouchSelection(mods);
+    }
+
+    fn endTouchSelection(self: *Self, mods: input.Mods) void {
+        const priv = self.private();
+        if (!priv.touch_selection_active) return;
+        priv.touch_selection_active = false;
+
+        const surface = priv.core_surface orelse return;
+        _ = surface.mouseButtonCallback(.release, .left, mods) catch |err| {
+            log.warn("error in touch selection release callback err={}", .{err});
+        };
     }
 
     fn touchTap(self: *Self, event: *gdk.Event, point: touch.Gesture.Point) void {
@@ -3158,6 +3232,12 @@ pub const Surface = extern struct {
             .touch_begin, .touch_update, .touch_end, .touch_cancel => true,
             else => false,
         };
+    }
+
+    fn touchModifiers(gesture: *gtk.GestureDrag) input.Mods {
+        const event = gesture.as(gtk.EventController).getCurrentEvent() orelse
+            return .{};
+        return gtk_key.translateMods(event.getModifierState());
     }
 
     fn ecMouseLeave(
